@@ -5,7 +5,7 @@ Reproduction of *SuperMimic: Scaling Humanoid Whole-Body Control with One Differ
 `newton.solvers.SolverMuJoCo`, which runs MuJoCo Warp, the simulator the paper uses.
 
 Done so far: the simulator side (a vectorized G1 motion-tracking env), the PPO-Sim baseline (built on
-[RLAlg](../RLAlg) losses, following the [RLDemos](../RLDemos) PPO trainer), and SuperMimic itself: replay
+[RLAlg](https://github.com/XZDang13/RLAlg) losses, following the [RLDemos](https://github.com/XZDang13/RLDemos) PPO trainer), and SuperMimic itself: replay
 buffer, learned dynamics f_ω fit on k=8 windows, and the H=32 BPTT actor-critic.
 
 ```bash
@@ -102,7 +102,7 @@ python scripts/prepare_bones_seed.py --num-clips 300 --out data/motions/bones_se
 - **Selection** (`prepare_bones_seed.py`): original takes only (no `_M` mirrors), body position "standing", no props,
   no object/environment interaction or stunts, 2-30 s. Clips are drawn round-robin over `content_type_of_movement`
   so walking and jogging do not dominate. The selection is saved to `data/bones_seed_retarget/selection.json`.
-- **Retargeting**: `../retargeter` `retarget offline` from the SOMA-uniform BVHs. Only clips its validator accepts
+- **Retargeting**: [retargeter](https://github.com/XZDang13/retargeter) (`retarget offline`, checked out at `../retargeter`) from the SOMA-uniform BVHs. Only clips its validator accepts
   (`Configs/reject/g1.json`) are converted. Root height is taken relative to the solver's ground estimate, and
   quaternions go from wxyz to xyzw.
 - **First subset** (seed 0): 300 selected, 233 accepted (0.48 h), about 1 min of retargeting on the 3090. Rejections
