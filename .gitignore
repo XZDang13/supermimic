@@ -1,0 +1,8 @@
+# training outputs and generated / licensed motion data (rebuild with scripts/)
+runs/
+data/
+# python / tooling
+__pycache__/
+*.egg-info/
+.pytest_cache/
+imgui.ini

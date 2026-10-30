@@ -1,0 +1,9 @@
+[project]
+name = "supermimic"
+version = "0.0.1"
+description = "SuperMimic reproduction on Newton (MuJoCo Warp)"
+requires-python = ">=3.10"
+dependencies = ["newton", "warp-lang", "torch", "numpy"]
+
+[tool.setuptools.packages.find]
+include = ["supermimic*"]
