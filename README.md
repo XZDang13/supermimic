@@ -143,6 +143,15 @@ fit the critic to GAE(λ=0.95) targets (5 epochs x 4 minibatches). Hyperparamete
   `--no-bf16 --checkpoint` restores TF32 with per-step activation checkpointing (1.65 s per iteration, about 5 GiB).
   In a 1000-iteration A/B the bf16 setup learned as well or slightly better (k=8 loss 0.18 vs 0.25; 8 vs 9 failed
   clips, normalized return 0.68 vs 0.65 at iteration 1000).
+- **Overhead pass**: about 0.73 s per iteration (collect 0.11 s, world-model fit 0.21 s, imagination 0.34-0.36 s,
+  critic 0.065 s), so 320k iterations take about 2.7 days. Changes: the whole k=8 world-model loss is one compiled graph
+  (before, only f_ω was compiled, so `state_error` and the 8-way gradient sums ran as ~48k eager ops). Normalizer
+  updates from masked rows go through `masked_update`, with no boolean index (host sync) and no float64 copy of the
+  105M-element critic batch. Critic minibatches have a fixed size and weight out clip-end rows, so their loss compiles.
+  Adam is fused. The sampler and episode tracking no longer sync per step. GEMMs are autotuned
+  (`max-autotune-no-cudagraphs`, ~5%; the first compile takes ~6-10 min and is cached, `--no-max-autotune` turns it off).
+  Learning matched the earlier run at the same seed over 300 iterations. Every phase is now GPU-bound. Collect is the
+  MuJoCo Warp graph (31 of 34.5 ms per env step). The rest of imagination is small FK / quaternion / LayerNorm kernels.
 
 ### First run on BONES-SEED (233 clips, 0.48 h)
 

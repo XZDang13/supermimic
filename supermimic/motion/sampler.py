@@ -84,25 +84,23 @@ class ReturnBasedSampler:
         self.discount *= self.gamma
         self.steps += 1
         window_full = self.steps >= self.window
-        closed = terminated | truncated | window_full
-        if closed.any():
-            ids = closed.nonzero(as_tuple=False).squeeze(-1)
-            n_eff = torch.where(terminated[ids], torch.full_like(self.steps[ids], self.window), self.steps[ids])
-            score = (self.ret[ids] / self._gmax(n_eff)).clamp(0.0, 1.0)
-            bins = self.start_bin[ids]
-            # EMA towards the new estimate; scatter-mean if several envs close the same bin
-            total = torch.zeros_like(self.bin_score).index_add_(0, bins, score)
-            count = torch.zeros_like(self.bin_score).index_add_(0, bins, torch.ones_like(score))
-            hit = count > 0
-            mean = total[hit] / count[hit]
-            first = self.bin_visits[hit] == 0
-            self.bin_score[hit] = torch.where(first, mean, (1 - self.ema) * self.bin_score[hit] + self.ema * mean)
-            self.bin_visits[hit] += count[hit]
-            # windows that filled up mid-episode restart from the bin the env is in now
-            cont = window_full & ~(terminated | truncated)
-            if cont.any():
-                cid = cont.nonzero(as_tuple=False).squeeze(-1)
-                self.begin(cid, frames[cid])
+        closed = (terminated | truncated | window_full).float()
+        # masked over all envs rather than indexed by the closed ones, so there is no host sync
+        n_eff = torch.where(terminated, torch.full_like(self.steps, self.window), self.steps)
+        score = (self.ret / self._gmax(n_eff)).clamp(0.0, 1.0)
+        # EMA towards the new estimate; scatter-mean if several envs close the same bin
+        total = torch.zeros_like(self.bin_score).index_add_(0, self.start_bin, torch.where(closed > 0, score, 0.0))
+        count = torch.zeros_like(self.bin_score).index_add_(0, self.start_bin, closed)
+        mean = total / count.clamp_min(1.0)
+        new = torch.where(self.bin_visits == 0, mean, (1 - self.ema) * self.bin_score + self.ema * mean)
+        self.bin_score.copy_(torch.where(count > 0, new, self.bin_score))
+        self.bin_visits += count
+        # windows that filled up mid-episode restart from the bin the env is in now
+        cont = window_full & ~(terminated | truncated)
+        self.start_bin.copy_(torch.where(cont, self.lib.frame_bin[frames], self.start_bin))
+        self.ret.masked_fill_(cont, 0.0)
+        self.discount.masked_fill_(cont, 1.0)
+        self.steps.masked_fill_(cont, 0)
 
     def stats(self) -> dict[str, float]:
         visited = self.bin_visits > 0

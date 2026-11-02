@@ -54,7 +54,8 @@ class SuperMimicCfg:
     max_grad_value: float = 0.1             # policy only, after the norm clip
     termination_temperature: tuple[float, float] = (0.02, 0.05)  # sigmoid widths for height (m) and tilt
     checkpoint_steps: bool = False          # recompute each imagined step in backward (~13 -> 5 GiB, +0.25 s)
-    compile: bool = True                    # torch.compile the imagined step and the world-model step
+    compile: bool = True                    # torch.compile the imagined step, the world-model loss and the critic loss
+    max_autotune: bool = True               # benchmark Triton GEMMs at compile time (~5% faster, first compile ~6 min)
     bf16: bool = True                       # bf16 autocast for the world-model fit and imagination (~2.6x matmul rate on Ampere)
     # critic
     lambda_: float = 0.95
@@ -107,17 +108,21 @@ class Trainer:
         self.world_model = WorldModel(hidden_dims=cfg.wm_dims, norm_position=norm).to(self.device)
 
         lr = cfg.learning_rate
-        self.wm_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=lr)
-        self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr, betas=cfg.policy_betas)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        fused = self.device.type == "cuda"
+        self.wm_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=lr, fused=fused)
+        self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr, betas=cfg.policy_betas, fused=fused)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr, fused=fused)
         self.optimizers = (self.wm_optimizer, self.policy_optimizer, self.critic_optimizer)
         self.schedulers = [torch.optim.lr_scheduler.LambdaLR(o, self._lr_factor) for o in self.optimizers]
 
         self._step_fn = self._imagine_step
+        self._critic_loss_fn = self._critic_loss
         if cfg.compile:
+            mode = "max-autotune-no-cudagraphs" if cfg.max_autotune else None
+            self._critic_loss_fn = torch.compile(self._critic_loss, dynamic=False, mode=mode)
             # thousands of small FK / quaternion / reward ops per step: fusing them removes the launch overhead
-            self._step_fn = torch.compile(self._imagine_step, dynamic=False)
-            self.world_model.compile_step()
+            self._step_fn = torch.compile(self._imagine_step, dynamic=False, mode=mode)
+            self.world_model.compile_step(mode)
         self.buffer = TransitionBuffer(self.num_envs, cfg.buffer_steps, G1TrackingEnv.STATE_DIM, A,
                                        G1TrackingEnv.CONTEXT_DIM, self.device)
         self.global_step = 0
@@ -160,11 +165,12 @@ class Trainer:
         metrics["rollout/reward"].append(reward.mean())
         metrics["rollout/termination_rate"].append(terminated.float().mean())
         done = terminated | truncated
-        if done.any():
-            metrics["episode/return"].append(self.episode_return[done].mean())
-            metrics["episode/length"].append(self.episode_length[done].mean())
-            self.episode_return[done] = 0.0
-            self.episode_length[done] = 0.0
+        # NaN when no episode ended this step (log takes the nanmean); avoids a host sync per step
+        n = done.sum()
+        metrics["episode/return"].append(torch.where(n > 0, (self.episode_return * done).sum() / n, torch.nan))
+        metrics["episode/length"].append(torch.where(n > 0, (self.episode_length * done).sum() / n, torch.nan))
+        self.episode_return.masked_fill_(done, 0.0)
+        self.episode_length.masked_fill_(done, 0.0)
 
     # ------------------------------------------------------------------ 2. world model
 
@@ -176,7 +182,7 @@ class Trainer:
         for _ in range(cfg.wm_batches):
             w = self.buffer.sample_windows(cfg.wm_batch_size, cfg.window)
             v = w["valid"]
-            wm.update_normalizers(w["state"][v], w["action"][v], w["context"][v])
+            wm.update_normalizers(w["state"], w["action"], w["context"], v)
             with self._autocast():
                 loss, err = wm.rollout_loss(w["state"], w["action"], w["context"], v)
             self.wm_optimizer.zero_grad(set_to_none=True)
@@ -289,7 +295,7 @@ class Trainer:
         obs = rec["critic_obs"]                                      # (T+1, B, C)
         T = obs.shape[0] - 1
         mask = rec["live"].bool()                                    # (T, B)
-        self.critic.update_normalizers(obs[:-1][mask])
+        self.critic.update_normalizers(obs[:-1].flatten(0, 1), mask.flatten())
         with torch.no_grad():
             values = self.critic(obs.flatten(0, 1)).value.view(T + 1, -1)
             targets = torch.zeros_like(rec["reward"])
@@ -300,14 +306,15 @@ class Trainer:
                 targets[t] = rec["reward"][t] + cfg.gamma * (1.0 - rec["done"][t]) * (
                     (1.0 - cfg.lambda_) * values[t + 1] + cfg.lambda_ * next_return)
                 next_return = targets[t]
-        x, y = obs[:-1][mask], targets[mask]
+        # all T*B samples in fixed-size minibatches, clip-end-truncated ones weighted out (no boolean index)
+        x, y, w = obs[:-1].flatten(0, 1), targets.flatten(), mask.flatten().float()
         n = x.shape[0]
         size = max(1, n // cfg.critic_minibatches)
         for _ in range(cfg.critic_epochs):
             perm = torch.randperm(n, device=self.device)
             for i in range(cfg.critic_minibatches):
                 idx = perm[i * size : (i + 1) * size]
-                loss = (self.critic(x[idx]).value - y[idx]).square().mean()
+                loss = self._critic_loss_fn(x[idx], y[idx], w[idx])
                 self.critic_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.max_grad_norm)
@@ -315,13 +322,21 @@ class Trainer:
                 metrics["critic/loss"].append(loss.detach())
         with torch.no_grad():
             pred = self.critic(x).value
-            metrics["critic/explained_variance"].append(1.0 - (y - pred).var() / y.var().clamp_min(1e-8))
-            metrics["critic/value"].append(pred.mean())
+            count = w.sum().clamp_min(1.0)
+            y_mean = (w * y).sum() / count
+            y_var = (w * (y - y_mean).square()).sum() / count
+            res = y - pred
+            res_var = (w * (res - (w * res).sum() / count).square()).sum() / count
+            metrics["critic/explained_variance"].append(1.0 - res_var / y_var.clamp_min(1e-8))
+            metrics["critic/value"].append((w * pred).sum() / count)
+
+    def _critic_loss(self, x, y, w):
+        return (w * (self.critic(x).value - y).square()).sum() / w.sum().clamp_min(1.0)
 
     # ------------------------------------------------------------------ loop
 
     def log(self, metrics, timings):
-        info = {k: float(torch.stack([torch.as_tensor(x, dtype=torch.float32, device=self.device) for x in v]).mean())
+        info = {k: float(torch.stack([torch.as_tensor(x, dtype=torch.float32, device=self.device) for x in v]).nanmean())
                 for k, v in metrics.items()}
         total = sum(timings.values())
         info.update({f"perf/{k}_s": v for k, v in timings.items()})

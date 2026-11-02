@@ -18,7 +18,7 @@ from RLAlg.normalizer import Normalizer
 
 from supermimic.envs import G1TrackingEnv
 from supermimic.envs.tracking import projected_gravity
-from supermimic.ppo.model import NORM_EPS
+from supermimic.ppo.model import NORM_EPS, masked_update
 from supermimic.utils.math import (
     axis_angle_to_quat,
     quat_apply,
@@ -95,8 +95,10 @@ class WorldModel(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def compile_step(self):
-        self._step = torch.compile(self._step_impl, dynamic=False)
+    def compile_step(self, mode: str | None = None):
+        self._step = torch.compile(self._step_impl, dynamic=False, mode=mode)
+        # the whole k-step loss as one graph: the per-step errors and the k-fold weight-gradient sums fuse too
+        self._rollout_loss = torch.compile(self._rollout_loss_impl, dynamic=False, mode=mode)
 
     def _out_std(self):
         return torch.sqrt(self.out_normalizer.var + self.out_normalizer.epsilon).float()
@@ -110,24 +112,36 @@ class WorldModel(nn.Module):
         return apply_delta(state, delta)
 
     @torch.no_grad()
-    def update_normalizers(self, states, actions, context):
-        """From windows: states (B, k+1, S), actions (B, k, A), context (B, C)."""
+    def update_normalizers(self, states, actions, context, valid=None):
+        """From windows: states (B, k+1, S), actions (B, k, A), context (B, C); only ``valid`` (B,) windows count."""
+        k = actions.shape[1]
         s, sn = states[:, :-1].flatten(0, 1), states[:, 1:].flatten(0, 1)
-        c = context[:, None].expand(-1, actions.shape[1], -1).flatten(0, 1)
-        self.in_normalizer.update(torch.cat((state_features(s), actions.flatten(0, 1), c), -1))
-        self.out_normalizer.update(state_delta(s, sn))
+        c = context[:, None].expand(-1, k, -1).flatten(0, 1)
+        x, d = torch.cat((state_features(s), actions.flatten(0, 1), c), -1), state_delta(s, sn)
+        if valid is None:
+            self.in_normalizer.update(x)
+            self.out_normalizer.update(d)
+        else:
+            mask = valid[:, None].expand(-1, k).flatten()
+            masked_update(self.in_normalizer, x, mask)
+            masked_update(self.out_normalizer, d, mask)
 
     def rollout_loss(self, states, actions, context, valid=None):
         """Eq. 1 (dynamics term): k-step autoregressive rollout from the logged s_0 on logged actions."""
+        if valid is None:
+            valid = torch.ones(states.shape[0], dtype=torch.bool, device=states.device)
+        fn = self._rollout_loss if hasattr(self, "_rollout_loss") else self._rollout_loss_impl
+        return fn(states, actions, context, valid)
+
+    def _rollout_loss_impl(self, states, actions, context, valid):
         k = actions.shape[1]
         scale = self._out_std()
         s = states[:, 0]
         errors = []
         for j in range(k):
-            s = self(s, actions[:, j], context)
+            s = self._step_impl(s, actions[:, j], context)
             errors.append(state_error(s, states[:, j + 1]) / scale)
         err = torch.stack(errors, 1)                          # (B, k, 70)
         per_window = err.square().mean((1, 2))
-        if valid is not None:
-            per_window = per_window[valid]
-        return per_window.mean(), err.detach()
+        w = valid.to(per_window.dtype)
+        return (per_window * w).sum() / w.sum().clamp_min(1.0), err.detach()

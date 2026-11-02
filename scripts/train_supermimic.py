@@ -33,6 +33,8 @@ def main():
                    help="recompute imagined activations in backward to save memory (default: off)")
     p.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=None,
                    help="bf16 autocast for the world-model fit and imagination (default: on)")
+    p.add_argument("--max-autotune", action=argparse.BooleanOptionalAction, default=None,
+                   help="autotune GEMMs when compiling (default: on; ~5%% faster, first compile ~6 min)")
     args = p.parse_args()
 
     env_cfg = G1TrackingEnvCfg(motion_files=args.motions, num_envs=args.num_envs, device=args.device)
@@ -47,6 +49,8 @@ def main():
         cfg.checkpoint_steps = args.checkpoint
     if args.bf16 is not None:
         cfg.bf16 = args.bf16
+    if args.max_autotune is not None:
+        cfg.max_autotune = args.max_autotune
 
     trainer = Trainer(env_cfg, cfg, seed=args.seed, log_dir=args.log_dir, use_wandb=args.wandb)
     print(trainer.env.motions)

@@ -26,6 +26,26 @@ from supermimic.utils.math import quat_apply_inv
 NORM_EPS = 1e-4
 
 
+@torch.no_grad()
+def masked_update(normalizer: Normalizer, x: torch.Tensor, mask: torch.Tensor):
+    """``normalizer.update(x[mask])`` for x (N, D), without the boolean index (a host sync).
+
+    Batch statistics are reduced in x's dtype and merged in float64, as ``Normalizer.update`` merges.
+    """
+    w = mask.to(x.dtype)[:, None]
+    n = w.sum()
+    mean = (x * w).sum(0) / n.clamp_min(1.0)
+    var = ((x - mean).square() * w).sum(0) / n.clamp_min(1.0)
+    n, mean, var = n.double(), mean.double(), var.double()
+    count = normalizer.count
+    total = count + n
+    delta = mean - normalizer.mean
+    m2 = normalizer.var * count + var * n + delta.square() * count * n / total.clamp_min(1.0)
+    normalizer.mean.add_(delta * n / total.clamp_min(1.0))
+    normalizer.var.copy_(torch.where(total > 0, m2 / total.clamp_min(1.0), normalizer.var).clamp_min(0.0))
+    normalizer.count.copy_(total)
+
+
 def critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
     """Privileged critic input (800,) built from the env's observation dict."""
     state = obs["state"]
@@ -85,8 +105,11 @@ class Critic(nn.Module):
         self.head = CriticHead(feature_dim)
 
     @torch.no_grad()
-    def update_normalizers(self, critic_obs: torch.Tensor):
-        self.normalizer.update(critic_obs)
+    def update_normalizers(self, critic_obs: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        if mask is None:
+            self.normalizer.update(critic_obs)
+        else:
+            masked_update(self.normalizer, critic_obs, mask)
 
     def forward(self, critic_obs: torch.Tensor) -> ValueStep:
         return self.head(self.layers(self.normalizer(critic_obs)))
