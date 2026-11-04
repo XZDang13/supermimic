@@ -16,7 +16,7 @@ import json
 import torch
 
 from supermimic.envs import G1TrackingEnv
-from supermimic.eval import eval_env_cfg, load_policy
+from supermimic.eval import checkpoint_robot, eval_env_cfg, load_policy
 
 
 def main():
@@ -27,7 +27,7 @@ def main():
     p.add_argument("--out", default=None, help="write per-clip results as JSON (view_policy.py --results reads it)")
     args = p.parse_args()
 
-    env_cfg = eval_env_cfg(args.motions, args.num_envs)
+    env_cfg = eval_env_cfg(args.motions, args.num_envs, robot=checkpoint_robot(args.checkpoint))
     env = G1TrackingEnv(env_cfg)
     policy = load_policy(args.checkpoint, env_cfg, env.device)
     m = env.motions

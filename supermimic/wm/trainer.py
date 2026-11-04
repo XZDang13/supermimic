@@ -30,7 +30,7 @@ from RLAlg.nn.layers import NormPosition
 from RLAlg.utils import set_seed_everywhere
 
 from supermimic.envs import G1TrackingEnv, G1TrackingEnvCfg
-from supermimic.ppo.model import Critic, critic_observation_dim
+from supermimic.ppo.model import Critic, context_scales, critic_observation_dim, fixed_scale, goal_scales, proprio_scales
 from supermimic.wm.dynamics import WorldModel
 from supermimic.wm.policy import Policy
 from supermimic.wm.replay import TransitionBuffer
@@ -61,6 +61,18 @@ class SuperMimicCfg:
     lambda_: float = 0.95
     critic_epochs: int = 5
     critic_minibatches: int = 4
+    # Rewards are at most r_max per step, so no value exceeds r_max / (1 - γ). Clamping the critic there (in its
+    # targets and in the policy's bootstrap) stops a self-bootstrapped overestimate from growing past the bound
+    # and the policy from chasing it; without it the critic drifted above the bound from ~10k iterations on.
+    clamp_value: bool = True
+    # Running normalizers stop updating after this many iterations (None: never). Normalization that keeps
+    # shifting moves every network's inputs under it; reproductions use fixed scales or freeze at ~2e8 samples.
+    freeze_normalizers_after: int | None = 5000
+    # Network inputs: hand-picked per-group scales, running statistics, or raw values. The world model's output
+    # scale also weighs its loss; without it, the deltas are predicted and weighed in raw units and the root
+    # position barely counts (8-step root error 51 mm instead of 3 mm).
+    input_norm: str = "fixed"
+    wm_output_norm: bool = True
     # networks
     encoder_dims: list[int] = field(default_factory=lambda: [2048, 1024, 512, 256])
     decoder_dims: list[int] = field(default_factory=lambda: [2048, 1024, 512, 256])
@@ -82,7 +94,7 @@ class Trainer:
     # printed each log interval (all metrics go to wandb)
     log_keys = ("episode/return", "episode/length", "rollout/termination_rate", "wm/loss", "wm/k_step_root_pos_m",
                 "wm/k_step_joint_pos_rad", "policy/objective", "imagine/survival_H", "critic/explained_variance",
-                "perf/iteration_s", "perf/collect_s", "perf/world_model_s", "perf/policy_s", "perf/critic_s")
+                "critic/value", "critic/above_max", "perf/iteration_s", "perf/collect_s", "perf/world_model_s", "perf/policy_s", "perf/critic_s")
 
     def __init__(self, env_cfg: G1TrackingEnvCfg, cfg: SuperMimicCfg, *, seed: int = 0, log_dir: str = "runs/supermimic",
                  use_wandb: bool = False):
@@ -95,17 +107,27 @@ class Trainer:
         self.env_cfg = env_cfg
         self.env = G1TrackingEnv(env_cfg)
         self.task = TrackingTask(self.env, cfg.termination_temperature)
+        rew = env_cfg.rewards
+        r_max = self.env.control_dt * sum(getattr(rew, k)[0] for k in
+                                          ("body_pos", "body_ori", "body_lin_vel", "body_ang_vel", "anchor_pos", "anchor_ori"))
+        self.value_max = r_max / (1.0 - cfg.gamma)
         self.device = torch.device(env_cfg.device)
         self.num_envs = self.env.num_envs
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         H, K = env_cfg.history_len, env_cfg.future_frames
-        P, G, A = G1TrackingEnv.PROPRIO_DIM, G1TrackingEnv.GOAL_FRAME_DIM, G1TrackingEnv.NUM_ACTIONS
+        env = self.env
+        P, G, A = env.PROPRIO_DIM, env.GOAL_FRAME_DIM, env.NUM_ACTIONS
         norm = NormPosition[cfg.norm_position]
         self.policy = Policy(H, P, K, G, A, cfg.encoder_dims, cfg.decoder_dims, cfg.latent_dim, norm).to(self.device)
-        self.critic = Critic(critic_observation_dim(K), cfg.critic_dims, norm).to(self.device)
-        self.world_model = WorldModel(hidden_dims=cfg.wm_dims, norm_position=norm).to(self.device)
+        self.critic = Critic(critic_observation_dim(env), cfg.critic_dims, norm).to(self.device)
+        self.world_model = WorldModel(A, env.CONTEXT_DIM, hidden_dims=cfg.wm_dims, norm_position=norm).to(self.device)
+        if cfg.input_norm == "fixed":
+            fixed_scale(self.policy.encoder.normalizer, *goal_scales(A))
+            fixed_scale(self.policy.proprio_normalizer, *proprio_scales(A))
+            fixed_scale(self.critic.normalizer, *proprio_scales(A), (4, 1.0), *goal_scales(A) * K, *context_scales(A))
+            fixed_scale(self.world_model.in_normalizer, (10, 1.0), (A, 0.5), (A, 3.0), (A, 1.0), *context_scales(A))
 
         lr = cfg.learning_rate
         fused = self.device.type == "cuda"
@@ -123,8 +145,7 @@ class Trainer:
             # thousands of small FK / quaternion / reward ops per step: fusing them removes the launch overhead
             self._step_fn = torch.compile(self._imagine_step, dynamic=False, mode=mode)
             self.world_model.compile_step(mode)
-        self.buffer = TransitionBuffer(self.num_envs, cfg.buffer_steps, G1TrackingEnv.STATE_DIM, A,
-                                       G1TrackingEnv.CONTEXT_DIM, self.device)
+        self.buffer = TransitionBuffer(self.num_envs, cfg.buffer_steps, env.STATE_DIM, A, env.CONTEXT_DIM, self.device)
         self.global_step = 0
         self.iteration = 0
         self._collect_credit = 0.0
@@ -142,13 +163,27 @@ class Trainer:
         cos = 0.5 * (1.0 + math.cos(math.pi * it / cfg.lr_decay_iterations))
         return cfg.lr_final_ratio + (1.0 - cfg.lr_final_ratio) * cos
 
+    @property
+    def update_normalizers(self) -> bool:
+        n = self.cfg.freeze_normalizers_after
+        return n is None or self.iteration < n
+
+    @property
+    def update_input_normalizers(self) -> bool:
+        return self.cfg.input_norm == "running" and self.update_normalizers
+
+    def _value(self, critic_obs):
+        v = self.critic(critic_obs).value
+        return v.clamp_max(self.value_max) if self.cfg.clamp_value else v
+
     # ------------------------------------------------------------------ 1. collect
 
     @torch.no_grad()
     def collect(self, steps: int, metrics):
         obs = self.obs
         for _ in range(steps):
-            self.policy.update_normalizers(obs)
+            if self.update_input_normalizers:
+                self.policy.update_normalizers(obs)
             action = self.policy(obs)
             action = action + self.cfg.action_noise * torch.randn_like(action)
             next_obs, reward, terminated, truncated, info = self.env.step(action)
@@ -182,7 +217,9 @@ class Trainer:
         for _ in range(cfg.wm_batches):
             w = self.buffer.sample_windows(cfg.wm_batch_size, cfg.window)
             v = w["valid"]
-            wm.update_normalizers(w["state"], w["action"], w["context"], v)
+            if self.update_normalizers:
+                wm.update_normalizers(w["state"], w["action"], w["context"], v,
+                                      inputs=cfg.input_norm == "running", outputs=cfg.wm_output_norm)
             with self._autocast():
                 loss, err = wm.rollout_loss(w["state"], w["action"], w["context"], v)
             self.wm_optimizer.zero_grad(set_to_none=True)
@@ -195,7 +232,7 @@ class Trainer:
         scaled = err_k * wm._out_std()
         metrics["wm/k_step_error"].append(err_k.square().mean())
         metrics["wm/k_step_root_pos_m"].append(scaled[:, 0:3].norm(dim=-1).mean())
-        metrics["wm/k_step_joint_pos_rad"].append(scaled[:, 12:41].abs().mean())
+        metrics["wm/k_step_joint_pos_rad"].append(scaled[:, 12 : 12 + self.env.NUM_ACTIONS].abs().mean())
 
     # ------------------------------------------------------------------ 3. policy through the world model
 
@@ -267,7 +304,7 @@ class Trainer:
                     bootstrap = truncated * live
                     if t == T - 1:
                         bootstrap = live
-                    value = self.critic(critic_obs).value
+                    value = self._value(critic_obs)
                     objective = objective + gamma ** (t + 1) * survival * bootstrap * value
                     live = live * (1.0 - truncated)
             # backward while ω and ψ are frozen: checkpointed steps are recomputed here
@@ -295,9 +332,10 @@ class Trainer:
         obs = rec["critic_obs"]                                      # (T+1, B, C)
         T = obs.shape[0] - 1
         mask = rec["live"].bool()                                    # (T, B)
-        self.critic.update_normalizers(obs[:-1].flatten(0, 1), mask.flatten())
+        if self.update_input_normalizers:
+            self.critic.update_normalizers(obs[:-1].flatten(0, 1), mask.flatten())
         with torch.no_grad():
-            values = self.critic(obs.flatten(0, 1)).value.view(T + 1, -1)
+            values = self._value(obs.flatten(0, 1)).view(T + 1, -1)
             targets = torch.zeros_like(rec["reward"])
             next_return = values[T]
             for t in reversed(range(T)):
@@ -329,6 +367,7 @@ class Trainer:
             res_var = (w * (res - (w * res).sum() / count).square()).sum() / count
             metrics["critic/explained_variance"].append(1.0 - res_var / y_var.clamp_min(1e-8))
             metrics["critic/value"].append((w * pred).sum() / count)
+            metrics["critic/above_max"].append((w * (pred > self.value_max)).sum() / count)
 
     def _critic_loss(self, x, y, w):
         return (w * (self.critic(x).value - y).square()).sum() / w.sum().clamp_min(1.0)
@@ -388,6 +427,7 @@ class Trainer:
             "critic": self.critic.state_dict(),
             "world_model": self.world_model.state_dict(),
             "optimizers": [o.state_dict() for o in self.optimizers],
+            "robot": self.env_cfg.robot,
             "iteration": self.iteration,
             "global_step": self.global_step,
             "cfg": asdict(self.cfg),

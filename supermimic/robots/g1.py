@@ -1,4 +1,5 @@
-"""Unitree G1 (29 DoF) as used by BeyondMimic / SuperMimic.
+"""Unitree G1 as used by BeyondMimic / SuperMimic: the 29-DoF robot and the 23-DoF variant
+(waist roll/pitch and wrist pitch/yaw locked, rubber hands).
 
 Actuator gains follow BeyondMimic: each joint is a PD loop with a 10 Hz natural
 frequency and damping ratio 2 about its reflected rotor armature, so the gains
@@ -10,14 +11,15 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass
 
 import newton.utils
 
 MJCF_FILE = "g1_29dof_rev_1_0.xml"
 
 
-def mjcf_path() -> str:
-    return str(newton.utils.download_asset("unitree_g1") / "mjcf" / MJCF_FILE)
+def mjcf_path(file: str = MJCF_FILE) -> str:
+    return str(newton.utils.download_asset("unitree_g1") / "mjcf" / file)
 
 
 # Actuated joints in MJCF (= Newton dof) order.
@@ -119,10 +121,10 @@ def _match(name: str, table):
     raise KeyError(f"no actuator group for joint {name}")
 
 
-def actuator_params() -> dict[str, list[float]]:
-    """Per-joint stiffness, damping, armature, effort limit and action scale (JOINT_NAMES order)."""
+def actuator_params(joint_names=JOINT_NAMES) -> dict[str, list[float]]:
+    """Per-joint stiffness, damping, armature, effort limit and action scale (``joint_names`` order)."""
     out = {"stiffness": [], "damping": [], "armature": [], "effort_limit": [], "action_scale": []}
-    for name in JOINT_NAMES:
+    for name in joint_names:
         effort, armature = _match(name, _ACTUATOR_GROUPS)
         kp = armature * NATURAL_FREQ**2
         kd = 2.0 * DAMPING_RATIO * armature * NATURAL_FREQ
@@ -134,9 +136,9 @@ def actuator_params() -> dict[str, list[float]]:
     return out
 
 
-def default_joint_pos() -> list[float]:
+def default_joint_pos(joint_names=JOINT_NAMES) -> list[float]:
     q = []
-    for name in JOINT_NAMES:
+    for name in joint_names:
         value = 0.0
         for pattern, v in DEFAULT_JOINT_POS.items():
             if re.fullmatch(pattern, name):
@@ -144,3 +146,44 @@ def default_joint_pos() -> list[float]:
                 break
         q.append(value)
     return q
+
+
+# ---------------------------------------------------------------------- variants
+
+JOINT_NAMES_23DOF = [n for n in JOINT_NAMES
+                     if n not in ("waist_roll_joint", "waist_pitch_joint", "left_wrist_pitch_joint",
+                                  "left_wrist_yaw_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint")]
+TRACKED_BODIES_23DOF = [{"left_wrist_yaw_link": "left_wrist_roll_rubber_hand",
+                         "right_wrist_yaw_link": "right_wrist_roll_rubber_hand"}.get(b, b) for b in TRACKED_BODIES]
+
+
+@dataclass(frozen=True)
+class Robot:
+    """One G1 variant: model file, actuated joints in MJCF order and the tracked bodies."""
+
+    name: str
+    mjcf_file: str
+    joint_names: tuple[str, ...]
+    tracked_bodies: tuple[str, ...]
+    root_body: str = ROOT_BODY
+    torso_body: str = TORSO_BODY
+    default_root_height: float = DEFAULT_ROOT_HEIGHT
+
+    @property
+    def num_joints(self) -> int:
+        return len(self.joint_names)
+
+    def mjcf_path(self) -> str:
+        return mjcf_path(self.mjcf_file)
+
+    def actuator_params(self) -> dict[str, list[float]]:
+        return actuator_params(self.joint_names)
+
+    def default_joint_pos(self) -> list[float]:
+        return default_joint_pos(self.joint_names)
+
+
+ROBOTS = {
+    "g1_29dof": Robot("g1_29dof", MJCF_FILE, tuple(JOINT_NAMES), tuple(TRACKED_BODIES)),
+    "g1_23dof": Robot("g1_23dof", "g1_23dof_rev_1_0.xml", tuple(JOINT_NAMES_23DOF), tuple(TRACKED_BODIES_23DOF)),
+}

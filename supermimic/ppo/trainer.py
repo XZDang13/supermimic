@@ -65,8 +65,8 @@ class Trainer:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         H, K = env_cfg.history_len, env_cfg.future_frames
-        P, G, A = G1TrackingEnv.PROPRIO_DIM, G1TrackingEnv.GOAL_FRAME_DIM, G1TrackingEnv.NUM_ACTIONS
-        C = critic_observation_dim(K)
+        P, G, A = self.env.PROPRIO_DIM, self.env.GOAL_FRAME_DIM, self.env.NUM_ACTIONS
+        C = critic_observation_dim(self.env)
         norm = NormPosition[cfg.norm_position]
         self.actor = Actor(H, P, K, G, A, cfg.encoder_dims, cfg.decoder_dims, cfg.latent_dim, norm, cfg.init_std).to(self.device)
         self.critic = Critic(C, cfg.critic_dims, norm).to(self.device)
@@ -248,6 +248,7 @@ class Trainer:
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "optimizer": self.optimizer.state_dict(),
+            "robot": self.env.cfg.robot,
             "iteration": self.iteration,
             "global_step": self.global_step,
             "ppo_cfg": asdict(self.cfg),

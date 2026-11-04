@@ -67,8 +67,9 @@ class G1TrackingEnvCfg:
 
     history_len: int = 10
     future_frames: int = 10
+    robot: str = "g1_29dof"                 # key of robots.g1.ROBOTS
     anchor_body: str = g1.ROOT_BODY
-    tracked_bodies: list[str] = field(default_factory=lambda: list(g1.TRACKED_BODIES))
+    tracked_bodies: list[str] | None = None  # None: the robot's tracked set
     soft_joint_limit_factor: float = 0.9
     rewards: RewardCfg = field(default_factory=RewardCfg)
 
@@ -105,15 +106,24 @@ class G1TrackingEnvCfg:
     sampler_window: int = 250
 
 
-class G1TrackingEnv:
-    NUM_ACTIONS = len(g1.JOINT_NAMES)
-    PROPRIO_DIM = 3 * NUM_ACTIONS + 6
-    GOAL_FRAME_DIM = 2 * NUM_ACTIONS + 9
-    STATE_DIM = 13 + 2 * NUM_ACTIONS
-    CONTEXT_DIM = 1 + NUM_ACTIONS + 3
+def env_dims(num_actions: int) -> dict[str, int]:
+    """Observation, goal, state and context sizes for a robot with ``num_actions`` joints."""
+    return {
+        "NUM_ACTIONS": num_actions,
+        "PROPRIO_DIM": 3 * num_actions + 6,
+        "GOAL_FRAME_DIM": 2 * num_actions + 9,
+        "STATE_DIM": 13 + 2 * num_actions,
+        "CONTEXT_DIM": 1 + num_actions + 3,
+    }
 
+
+class G1TrackingEnv:
     def __init__(self, cfg: G1TrackingEnvCfg):
         self.cfg = cfg
+        self.robot = g1.ROBOTS[cfg.robot]
+        # per-robot sizes (NUM_ACTIONS, PROPRIO_DIM, GOAL_FRAME_DIM, STATE_DIM, CONTEXT_DIM)
+        self.__dict__.update(env_dims(self.robot.num_joints))
+        self.tracked_bodies = list(cfg.tracked_bodies or self.robot.tracked_bodies)
         self.num_envs = n = cfg.num_envs
         self.device = cfg.device
         self.control_dt = cfg.sim_dt * cfg.decimation
@@ -128,7 +138,8 @@ class G1TrackingEnv:
             # default stream). This sets the process-wide current torch stream.
             torch.cuda.set_stream(wp.stream_to_torch(wp.get_stream(self.device)))
 
-        self.motions = MotionLibrary(cfg.motion_files, fps=1.0 / self.control_dt, device=self.device)
+        self.motions = MotionLibrary(cfg.motion_files, fps=1.0 / self.control_dt, device=self.device,
+                                     joint_names=self.robot.joint_names)
         self._build_sim()
         self._init_buffers()
 
@@ -147,7 +158,7 @@ class G1TrackingEnv:
         robot = newton.ModelBuilder()
         newton.solvers.SolverMuJoCo.register_custom_attributes(robot)
         robot.default_shape_cfg.mu = cfg.nominal_friction
-        robot.add_mjcf(g1.mjcf_path(), floating=True, enable_self_collisions=cfg.self_collisions)
+        robot.add_mjcf(self.robot.mjcf_path(), floating=True, enable_self_collisions=cfg.self_collisions)
 
         short = lambda label: label.rsplit("/", 1)[-1]
         joint_names = [short(lbl) for lbl in robot.joint_label]
@@ -157,11 +168,11 @@ class G1TrackingEnv:
         self.dofs_per_world = robot.joint_dof_count
         assert self.coords_per_world == 7 + self.NUM_ACTIONS and self.dofs_per_world == 6 + self.NUM_ACTIONS
 
-        # Newton dof index of each actuated joint, in g1.JOINT_NAMES order
-        dof_idx = [robot.joint_qd_start[joint_names.index(j)] for j in g1.JOINT_NAMES]
+        # Newton dof index of each actuated joint, in the robot's joint order
+        dof_idx = [robot.joint_qd_start[joint_names.index(j)] for j in self.robot.joint_names]
         assert dof_idx == list(range(6, 6 + self.NUM_ACTIONS)), "expected MJCF joint order"
-        act = g1.actuator_params()
-        q0 = g1.default_joint_pos()
+        act = self.robot.actuator_params()
+        q0 = self.robot.default_joint_pos()
         for i, d in enumerate(dof_idx):
             robot.joint_target_ke[d] = act["stiffness"][i]
             robot.joint_target_kd[d] = act["damping"][i]
@@ -170,7 +181,7 @@ class G1TrackingEnv:
             robot.joint_target_mode[d] = int(newton.JointTargetMode.POSITION)
             robot.joint_target_pos[d] = q0[i]
             robot.joint_q[7 + i] = q0[i]
-        robot.joint_q[2] = g1.DEFAULT_ROOT_HEIGHT
+        robot.joint_q[2] = self.robot.default_root_height
 
         builder = newton.ModelBuilder()
         builder.replicate(robot, self.num_envs)
@@ -237,10 +248,10 @@ class G1TrackingEnv:
         self._robot_shape_ids = robot_shapes
         self._robot_shape_world = shape_world[robot_shapes]
 
-        self.root_idx = self.body_names.index(g1.ROOT_BODY)
+        self.root_idx = self.body_names.index(self.robot.root_body)
         self.anchor_idx = self.body_names.index(self.cfg.anchor_body)
-        self.torso_idx = self.body_names.index(g1.TORSO_BODY)
-        self.tracked_idx = torch.tensor([self.body_names.index(b) for b in self.cfg.tracked_bodies], device=d)
+        self.torso_idx = self.body_names.index(self.robot.torso_body)
+        self.tracked_idx = torch.tensor([self.body_names.index(b) for b in self.tracked_bodies], device=d)
         self.nominal_torso_com = self.body_com[0, self.torso_idx].clone()
         # MuJoCo Warp's per-world body CoM, written directly on reset: notifying
         # BODY_INERTIAL_PROPERTIES re-runs set_const over every world (~50 ms at 4096
@@ -250,9 +261,9 @@ class G1TrackingEnv:
         self.mjc_torso_idx = int((mjc_to_newton == self.torso_idx).nonzero()[0, 0])
         assert torch.allclose(self.mjw_body_ipos[0, self.mjc_torso_idx], self.nominal_torso_com, atol=1e-6)
 
-        act = g1.actuator_params()
+        act = self.robot.actuator_params()
         self.action_scale = torch.tensor(act["action_scale"], device=d)
-        self.default_joint_pos = torch.tensor(g1.default_joint_pos(), device=d)
+        self.default_joint_pos = torch.tensor(self.robot.default_joint_pos(), device=d)
         lower = wp.to_torch(self.model.joint_limit_lower).view(n, -1)[0, 6:]
         upper = wp.to_torch(self.model.joint_limit_upper).view(n, -1)[0, 6:]
         mid, half = 0.5 * (lower + upper), 0.5 * (upper - lower) * self.cfg.soft_joint_limit_factor

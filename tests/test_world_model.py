@@ -6,12 +6,17 @@ import torch
 from supermimic.envs import G1TrackingEnv, G1TrackingEnvCfg
 from supermimic.wm.kinematics import TorchFK
 
-MOTIONS = "data/motions/test"
+import os
+
+MOTIONS = {"g1_29dof": "data/motions/test", "g1_23dof": "data/motions/test_23dof.npz"}
 
 
-@pytest.fixture(scope="module")
-def env():
-    e = G1TrackingEnv(G1TrackingEnvCfg(motion_files=MOTIONS, num_envs=32, use_cuda_graph=False))
+@pytest.fixture(scope="module", params=list(MOTIONS))
+def env(request):
+    if not os.path.exists(MOTIONS[request.param]):
+        pytest.skip(f"{MOTIONS[request.param]} missing (scripts/pack_motions.py --limit 20)")
+    e = G1TrackingEnv(G1TrackingEnvCfg(motion_files=MOTIONS[request.param], num_envs=32, use_cuda_graph=False,
+                                       robot=request.param))
     e.reset()
     for _ in range(10):  # moving, contact-rich states
         e.step(0.5 * torch.randn(e.num_envs, e.NUM_ACTIONS, device=e.device))
@@ -21,7 +26,9 @@ def env():
 def test_fk_matches_newton(env):
     fk = TorchFK(env.model, env.device)
     s = env._compute_obs()["state"]
-    pos, quat, lin, ang = fk(s[:, :3], s[:, 3:7], s[:, 7:10], s[:, 10:13], s[:, 13:42], s[:, 42:])
+    from supermimic.wm.task import split_state
+
+    pos, quat, lin, ang = fk(*split_state(s))
     rpos, rquat, rlin, rang = env._bodies(env.body_q, env.body_qd)
     assert (pos - rpos).abs().max() < 1e-4
     assert torch.minimum((quat - rquat).abs().amax(-1), (quat + rquat).abs().amax(-1)).max() < 1e-4

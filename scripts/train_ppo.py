@@ -14,6 +14,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--motions", default="data/motions/test")
     p.add_argument("--num-envs", type=int, default=4096)
+    p.add_argument("--robot", default="g1_29dof", choices=["g1_29dof", "g1_23dof"])
     p.add_argument("--iterations", type=int, default=30000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-dir", default="runs/ppo")
@@ -26,7 +27,8 @@ def main():
     p.add_argument("--small", action="store_true", help="BeyondMimic-sized MLPs (512, 256, 128) for quick runs")
     args = p.parse_args()
 
-    env_cfg = G1TrackingEnvCfg(motion_files=args.motions, num_envs=args.num_envs, device=args.device)
+    env_cfg = G1TrackingEnvCfg(motion_files=args.motions, num_envs=args.num_envs, device=args.device,
+                               robot=args.robot)
     cfg = PPOCfg()
     if args.rollout_steps:
         cfg.rollout_steps = args.rollout_steps

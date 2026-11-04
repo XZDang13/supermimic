@@ -20,11 +20,9 @@ from supermimic.envs.tracking import goal_obs, proprio_obs, termination_errors, 
 from supermimic.ppo.model import critic_observation
 from supermimic.wm.kinematics import TorchFK
 
-NA = G1TrackingEnv.NUM_ACTIONS
-
-
 def split_state(s: torch.Tensor):
-    return s[:, :3], s[:, 3:7], s[:, 7:10], s[:, 10:13], s[:, 13 : 13 + NA], s[:, 13 + NA :]
+    na = (s.shape[-1] - 13) // 2
+    return s[:, :3], s[:, 3:7], s[:, 7:10], s[:, 10:13], s[:, 13 : 13 + na], s[:, 13 + na :]
 
 
 class TrackingTask:
@@ -44,17 +42,10 @@ class TrackingTask:
         self.temperature = termination_temperature
         self._future = torch.arange(1, cfg.future_frames + 1, device=env.device)
 
-        # reference link states of every library frame, (F, B, 3|4); only anchor and tracked bodies kept
+        # only the anchor and the tracked bodies enter the reward
         keep = torch.cat((torch.tensor([env.anchor_idx], device=env.device), env.tracked_idx))
         self._keep = keep
         self.anchor_idx_kept, self.tracked_idx_kept = 0, torch.arange(1, len(keep), device=env.device)
-        ref = [[] for _ in range(4)]
-        for s in range(0, m.num_frames, 65536):
-            f = torch.arange(s, min(s + 65536, m.num_frames), device=env.device)
-            out = self.fk(m.root_pos[f], m.root_quat[f], m.root_lin_vel[f], m.root_ang_vel[f], m.joint_pos[f], m.joint_vel[f])
-            for lst, x in zip(ref, out):
-                lst.append(x[:, keep])
-        self.ref_pos, self.ref_quat, self.ref_lin_vel, self.ref_ang_vel = (torch.cat(x) for x in ref)
 
     # ------------------------------------------------------------------ heads
 
@@ -63,7 +54,7 @@ class TrackingTask:
 
     def proprio(self, state, prev_actions, context):
         _, quat, _, ang, q, qd = split_state(state)
-        return proprio_obs(quat, ang, q, qd, self.default_joint_pos, context[:, 1 : 1 + NA], prev_actions)
+        return proprio_obs(quat, ang, q, qd, self.default_joint_pos, context[:, 1 : 1 + q.shape[-1]], prev_actions)
 
     def add_noise(self, proprio):
         return proprio + (2.0 * torch.rand_like(proprio) - 1.0) * self.noise_scale
@@ -79,11 +70,24 @@ class TrackingTask:
         k = self._keep
         return pos[:, k], quat[:, k], lin[:, k], ang[:, k]
 
+    def reference_bodies(self, frames):
+        """Reference link states at library ``frames``, by FK of the reference (constant: no gradient).
+
+        Computed per step rather than stored per library frame, which would take 13 floats per body
+        per frame (about 35 GB for the full BONES-SEED set).
+        """
+        m = self.motions
+        with torch.no_grad():
+            pos, quat, lin, ang = self.fk(m.root_pos[frames], m.root_quat[frames], m.root_lin_vel[frames],
+                                          m.root_ang_vel[frames], m.joint_pos[frames], m.joint_vel[frames])
+        k = self._keep
+        return pos[:, k], quat[:, k], lin[:, k], ang[:, k]
+
     def reward(self, state, actions, prev_actions, frames):
         """Reward of reaching ``state`` at reference ``frames`` after ``actions``, and the tracking errors."""
-        ref = (self.ref_pos[frames], self.ref_quat[frames], self.ref_lin_vel[frames], self.ref_ang_vel[frames])
+        ref = self.reference_bodies(frames)
         errs = tracking_errors(self.bodies(state), ref, self.anchor_idx_kept, self.tracked_idx_kept)
-        reward, _ = tracking_reward(self.reward_cfg, self.dt, errs, state[:, 13 : 13 + NA], actions, prev_actions,
+        reward, _ = tracking_reward(self.reward_cfg, self.dt, errs, split_state(state)[4], actions, prev_actions,
                                     self.soft_lower, self.soft_upper)
         return reward, errs
 
