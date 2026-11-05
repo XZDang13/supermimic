@@ -9,7 +9,9 @@ import torch
 
 from RLAlg.nn.layers import NormPosition
 
-from supermimic.envs import G1TrackingEnv, G1TrackingEnvCfg
+from supermimic.envs import G1TrackingEnvCfg
+from supermimic.envs.g1_tracking_env import env_dims
+from supermimic.robots import g1
 from supermimic.ppo.model import Actor
 from supermimic.ppo.trainer import PPOCfg
 from supermimic.wm.policy import Policy
@@ -28,6 +30,12 @@ def eval_env_cfg(motions, num_envs: int, **overrides) -> G1TrackingEnvCfg:
     return G1TrackingEnvCfg(**cfg)
 
 
+def checkpoint_robot(path) -> str:
+    """Robot a checkpoint was trained on (checkpoints from before robot variants are the 29-DoF G1)."""
+    require_checkpoint(path)
+    return torch.load(path, map_location="cpu", weights_only=False).get("robot", "g1_29dof")
+
+
 def require_checkpoint(path):
     """Exit with the checkpoints that do exist when ``path`` is missing."""
     if Path(path).is_file():
@@ -44,8 +52,8 @@ def load_policy(path, env_cfg, device):
     """
     require_checkpoint(path)
     ckpt = torch.load(path, map_location=device)
-    dims = (env_cfg.history_len, G1TrackingEnv.PROPRIO_DIM, env_cfg.future_frames, G1TrackingEnv.GOAL_FRAME_DIM,
-            G1TrackingEnv.NUM_ACTIONS)
+    d = env_dims(g1.ROBOTS[env_cfg.robot].num_joints)
+    dims = (env_cfg.history_len, d["PROPRIO_DIM"], env_cfg.future_frames, d["GOAL_FRAME_DIM"], d["NUM_ACTIONS"])
     if "policy" in ckpt:
         known = {f.name for f in fields(SuperMimicCfg)}
         cfg = SuperMimicCfg(**{k: v for k, v in ckpt["cfg"].items() if k in known})

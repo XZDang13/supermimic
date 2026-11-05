@@ -27,17 +27,16 @@ import torch
 import warp as wp
 
 from supermimic.envs import G1TrackingEnv
-from supermimic.eval import eval_env_cfg, load_policy, require_checkpoint
-from supermimic.robots import g1
+from supermimic.eval import checkpoint_robot, eval_env_cfg, load_policy, require_checkpoint
 
 GHOST_COLOR = (0.95, 0.55, 0.15)
 
 
-def build_display_model(num_slots: int, ghost: bool, device):
+def build_display_model(mjcf: str, num_slots: int, ghost: bool, device):
     """Kinematic-only scene: per slot the simulated robot, then (optionally) the reference ghost."""
     robot = newton.ModelBuilder()
     newton.solvers.SolverMuJoCo.register_custom_attributes(robot)
-    robot.add_mjcf(g1.mjcf_path(), floating=True, enable_self_collisions=False)
+    robot.add_mjcf(mjcf, floating=True, enable_self_collisions=False)
     slot = newton.ModelBuilder()
     newton.solvers.SolverMuJoCo.register_custom_attributes(slot)
     for _ in range(2 if ghost else 1):
@@ -74,7 +73,7 @@ def clip_order(motions, pattern, results):
 class PolicyViewer:
     def __init__(self, args):
         self.args = args
-        self.env_cfg = eval_env_cfg(args.motions, args.grid)
+        self.env_cfg = eval_env_cfg(args.motions, args.grid, robot=checkpoint_robot(args.checkpoint))
         self.env = env = G1TrackingEnv(self.env_cfg)
         self.motions = m = env.motions
         self.policy = load_policy(args.checkpoint, self.env_cfg, env.device)
@@ -88,7 +87,7 @@ class PolicyViewer:
         self.ghost_offset = torch.tensor(args.ghost_offset, device=env.device)
         self.watched = defaultdict(lambda: {"plays": 0, "fails": 0, "last": ""})
 
-        self.model, self.coords = build_display_model(args.grid, not args.no_ghost, env.device)
+        self.model, self.coords = build_display_model(env.robot.mjcf_path(), args.grid, not args.no_ghost, env.device)
         self.state = self.model.state()
         self.display_q = wp.to_torch(self.model.joint_q).view(args.grid, -1)
 

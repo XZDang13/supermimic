@@ -4,14 +4,24 @@ import pytest
 import torch
 
 from supermimic.envs import G1TrackingEnv, G1TrackingEnvCfg
+from supermimic.envs.g1_tracking_env import env_dims
+from supermimic.ppo.model import context_scales, goal_scales, proprio_scales
+from supermimic.wm.dynamics import WorldModel
 from supermimic.wm.kinematics import TorchFK
 
-MOTIONS = "data/motions/test"
+import os
+
+MOTIONS = {"g1_29dof": "data/motions/test", "g1_23dof": "data/motions/test_23dof.npz"}
 
 
-@pytest.fixture(scope="module")
-def env():
-    e = G1TrackingEnv(G1TrackingEnvCfg(motion_files=MOTIONS, num_envs=32, use_cuda_graph=False))
+@pytest.fixture(scope="module", params=list(MOTIONS))
+def env(request):
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA GPU")
+    if not os.path.exists(MOTIONS[request.param]):
+        pytest.skip(f"{MOTIONS[request.param]} missing (scripts/pack_motions.py --limit 20)")
+    e = G1TrackingEnv(G1TrackingEnvCfg(motion_files=MOTIONS[request.param], num_envs=32, use_cuda_graph=False,
+                                       robot=request.param))
     e.reset()
     for _ in range(10):  # moving, contact-rich states
         e.step(0.5 * torch.randn(e.num_envs, e.NUM_ACTIONS, device=e.device))
@@ -21,7 +31,9 @@ def env():
 def test_fk_matches_newton(env):
     fk = TorchFK(env.model, env.device)
     s = env._compute_obs()["state"]
-    pos, quat, lin, ang = fk(s[:, :3], s[:, 3:7], s[:, 7:10], s[:, 10:13], s[:, 13:42], s[:, 42:])
+    from supermimic.wm.task import split_state
+
+    pos, quat, lin, ang = fk(*split_state(s))
     rpos, rquat, rlin, rang = env._bodies(env.body_q, env.body_qd)
     assert (pos - rpos).abs().max() < 1e-4
     assert torch.minimum((quat - rquat).abs().amax(-1), (quat + rquat).abs().amax(-1)).max() < 1e-4
@@ -47,6 +59,26 @@ def test_analytic_heads_match_env(env):
     assert torch.equal(task.termination(s, frames, hard=True).bool(), terminated)
     d = task.termination(s, frames)
     assert ((d > 0.5) == terminated).float().mean() > 0.9
+
+
+@pytest.mark.parametrize("joints", [23, 29])
+def test_fixed_scales_cover_every_input(joints):
+    d = env_dims(joints)
+    size = lambda groups: sum(n for n, _ in groups)
+    assert size(proprio_scales(joints)) == d["PROPRIO_DIM"]
+    assert size(goal_scales(joints)) == d["GOAL_FRAME_DIM"]
+    assert size(context_scales(joints)) == d["CONTEXT_DIM"]
+
+
+@pytest.mark.parametrize("inputs, outputs", [(True, True), (False, True), (True, False)])
+def test_world_model_normalizer_updates_are_selectable(inputs, outputs):
+    joints, context_dim = 23, env_dims(23)["CONTEXT_DIM"]
+    wm = WorldModel(joints, context_dim, hidden_dims=[8])
+    states = torch.randn(4, 3, env_dims(joints)["STATE_DIM"])
+    states[..., 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0])
+    wm.update_normalizers(states, torch.randn(4, 2, joints), torch.randn(4, context_dim), inputs=inputs, outputs=outputs)
+    assert (wm.in_normalizer.count.item() > 0) == inputs
+    assert (wm.out_normalizer.count.item() > 0) == outputs
 
 
 def test_replay_windows_and_history():

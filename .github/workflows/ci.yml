@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==2.3.1 pytest==9.1.1 mujoco==3.8.0 mujoco-warp==3.8.0.3 warp-lang==1.13.0 newton==1.2.0
+          pip install "RLAlg @ git+https://github.com/XZDang13/RLAlg.git@1ffc0384b25869e7eb607c0300647b82cafb8bde"
+          pip install -e . --no-deps
+      - name: Compile
+        run: python -m compileall -q scripts supermimic tests
+      # GitHub's runners have no GPU: simulator tests skip, run them locally
+      - name: Test
+        run: python -m pytest tests -q

@@ -3,9 +3,9 @@
 The network sees a heading-invariant view of the state (root height, projected gravity, root
 velocities in the root frame, joint q and qd) with the action and sim context, and predicts
 the change over one control step in the root frame of step t: root displacement, rotation
-vector, change of root linear and angular velocity, Δq and Δq̇. Inputs and outputs are
-normalized by running statistics; the loss weighs each dimension by the scale of its
-one-step change, so positions, velocities and joints count alike.
+vector, change of root linear and angular velocity, Δq and Δq̇. Inputs are scaled by the
+in-normalizer and outputs by running statistics; the loss weighs each dimension by the scale
+of its one-step change, so positions, velocities and joints count alike.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ import torch.nn as nn
 from RLAlg.nn.layers import NormPosition, make_mlp_layers
 from RLAlg.normalizer import Normalizer
 
-from supermimic.envs import G1TrackingEnv
 from supermimic.envs.tracking import projected_gravity
 from supermimic.ppo.model import NORM_EPS, masked_update
 from supermimic.utils.math import (
@@ -30,10 +29,14 @@ from supermimic.utils.math import (
 )
 from supermimic.wm.task import split_state
 
-NA = G1TrackingEnv.NUM_ACTIONS
-STATE_DIM = G1TrackingEnv.STATE_DIM
-FEATURE_DIM = 1 + 3 + 3 + 3 + 2 * NA       # 68
-DELTA_DIM = 12 + 2 * NA                    # 70
+
+
+def feature_dim(num_joints: int) -> int:
+    return 1 + 3 + 3 + 3 + 2 * num_joints    # 68 for the 29-DoF G1
+
+
+def delta_dim(num_joints: int) -> int:
+    return 12 + 2 * num_joints               # 70 for the 29-DoF G1
 
 
 def state_features(state):
@@ -63,8 +66,8 @@ def apply_delta(state, delta):
         quat_normalize(quat_mul(quat, axis_angle_to_quat(d_rot))),
         lin + quat_apply(quat, d_lin),
         ang + quat_apply(quat, d_ang),
-        q + delta[:, 12 : 12 + NA],
-        qd + delta[:, 12 + NA :],
+        q + delta[:, 12 : 12 + q.shape[-1]],
+        qd + delta[:, 12 + q.shape[-1] :],
     ), -1)
 
 
@@ -83,15 +86,17 @@ def state_error(pred, target):
 
 
 class WorldModel(nn.Module):
-    def __init__(self, action_dim: int = NA, context_dim: int = G1TrackingEnv.CONTEXT_DIM,
+    def __init__(self, action_dim: int, context_dim: int,
                  hidden_dims: list[int] = (2048, 2048, 2048), norm_position: NormPosition = NormPosition.POST):
         super().__init__()
-        in_dim = FEATURE_DIM + action_dim + context_dim
+        # one action per joint
+        in_dim = feature_dim(action_dim) + action_dim + context_dim
+        out_dim = delta_dim(action_dim)
         self.in_normalizer = Normalizer(in_dim, epsilon=NORM_EPS)
-        self.out_normalizer = Normalizer(DELTA_DIM, epsilon=1e-6)  # std floor 1e-3: one-step changes are small
-        self.layers, feature_dim = make_mlp_layers(in_dim, list(hidden_dims), activate_function=nn.SiLU(),
-                                                   norm_position=norm_position)
-        self.head = nn.Linear(feature_dim, DELTA_DIM)
+        self.out_normalizer = Normalizer(out_dim, epsilon=1e-6)  # std floor 1e-3: one-step changes are small
+        self.layers, width = make_mlp_layers(in_dim, list(hidden_dims), activate_function=nn.SiLU(),
+                                             norm_position=norm_position)
+        self.head = nn.Linear(width, out_dim)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
@@ -112,18 +117,18 @@ class WorldModel(nn.Module):
         return apply_delta(state, delta)
 
     @torch.no_grad()
-    def update_normalizers(self, states, actions, context, valid=None):
+    def update_normalizers(self, states, actions, context, valid=None, inputs=True, outputs=True):
         """From windows: states (B, k+1, S), actions (B, k, A), context (B, C); only ``valid`` (B,) windows count."""
         k = actions.shape[1]
         s, sn = states[:, :-1].flatten(0, 1), states[:, 1:].flatten(0, 1)
         c = context[:, None].expand(-1, k, -1).flatten(0, 1)
         x, d = torch.cat((state_features(s), actions.flatten(0, 1), c), -1), state_delta(s, sn)
         if valid is None:
-            self.in_normalizer.update(x)
-            self.out_normalizer.update(d)
-        else:
-            mask = valid[:, None].expand(-1, k).flatten()
+            valid = torch.ones(states.shape[0], dtype=torch.bool, device=states.device)
+        mask = valid[:, None].expand(-1, k).flatten()
+        if inputs:
             masked_update(self.in_normalizer, x, mask)
+        if outputs:
             masked_update(self.out_normalizer, d, mask)
 
     def rollout_loss(self, states, actions, context, valid=None):

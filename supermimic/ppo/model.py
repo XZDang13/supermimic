@@ -46,6 +46,24 @@ def masked_update(normalizer: Normalizer, x: torch.Tensor, mask: torch.Tensor):
     normalizer.count.copy_(total)
 
 
+def fixed_scale(normalizer: Normalizer, *groups: tuple[int, float]):
+    """Set ``normalizer`` to zero mean and hand-picked std, from (size, std) groups of its dimensions."""
+    std = torch.cat([torch.full((n, ), s, dtype=normalizer.var.dtype) for n, s in groups]).to(normalizer.var.device)
+    normalizer.var.copy_(std.square())
+
+
+def proprio_scales(j: int) -> list[tuple[int, float]]:
+    return [(j, 0.5), (j, 3.0), (3, 1.0), (3, 1.0), (j, 1.0)]        # q, qd, angular velocity, gravity, prev action
+
+
+def goal_scales(j: int) -> list[tuple[int, float]]:
+    return [(j, 0.5), (j, 3.0), (3, 0.2), (6, 1.0)]                  # q, qd, relative root position, orientation
+
+
+def context_scales(j: int) -> list[tuple[int, float]]:
+    return [(1, 1.0), (j, 0.02), (3, 0.05)]                          # friction, joint offset, torso CoM offset
+
+
 def critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
     """Privileged critic input (800,) built from the env's observation dict."""
     state = obs["state"]
@@ -54,8 +72,8 @@ def critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
     return torch.cat((obs["proprio"], root_height, root_lin_vel_b, obs["goal"].flatten(1), obs["context"]), dim=-1)
 
 
-def critic_observation_dim(future_frames: int) -> int:
-    return G1TrackingEnv.PROPRIO_DIM + 4 + future_frames * G1TrackingEnv.GOAL_FRAME_DIM + G1TrackingEnv.CONTEXT_DIM
+def critic_observation_dim(env: G1TrackingEnv) -> int:
+    return env.PROPRIO_DIM + 4 + env.cfg.future_frames * env.GOAL_FRAME_DIM + env.CONTEXT_DIM
 
 
 class MotionEncoder(nn.Module):
