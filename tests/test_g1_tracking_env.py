@@ -10,6 +10,8 @@ import warp as wp
 from supermimic.envs import G1TrackingEnv, G1TrackingEnvCfg
 from supermimic.utils.math import quat_conj, quat_error_magnitude, quat_mul, quat_to_axis_angle
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+
 NO_PERTURB = ((0.0, 0.0),) * 6
 
 
