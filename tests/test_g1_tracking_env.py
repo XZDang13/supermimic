@@ -63,6 +63,35 @@ def test_reference_velocities_match_finite_differences(env):
     assert (fd_ang - ang).abs().max() < 0.1
 
 
+def _stepped_history(env):
+    """Reset, then step until each env's history frames differ, so a shifted history is visible."""
+    env.reset()
+    action = torch.zeros_like(env.actions)
+    for _ in range(4):
+        obs, *_ = env.step(action)
+    return obs["policy"], action
+
+
+def test_auto_reset_leaves_other_histories_alone(env):
+    """A world finishing in step() appends exactly one frame to the others and refills only itself."""
+    before, action = _stepped_history(env)
+    env.episode_step[0] = env.max_episode_steps
+    obs, _, terminated, truncated, info = env.step(action)
+    done = terminated | truncated
+    assert done[0] and not done.all()
+    assert torch.equal(obs["policy"][~done], info["next_obs"]["policy"][~done])
+    assert torch.equal(obs["policy"][~done][:, :-1], before[~done][:, 1:])
+    assert torch.equal(obs["policy"][done], obs["policy"][done][:, -1:].expand_as(obs["policy"][done]))
+
+
+def test_reset_envs_leaves_other_histories_alone(env):
+    before, _ = _stepped_history(env)
+    ids = torch.tensor([0], device=env.device)
+    obs = env.reset_envs(ids, env.motions.clip_start[:1])
+    assert torch.equal(obs["policy"][1:], before[1:])
+    assert torch.equal(obs["policy"][0], obs["policy"][0, -1:].expand_as(obs["policy"][0]))
+
+
 def test_domain_randomization_reaches_mujoco():
     env = make_env(num_envs=8, randomize=True)
     env.reset()

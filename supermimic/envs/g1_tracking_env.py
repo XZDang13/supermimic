@@ -311,11 +311,7 @@ class G1TrackingEnv:
         self._reset_envs(env_ids, frames)
         mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         mask[env_ids] = True
-        history = self.history.clone()
-        obs = self._compute_obs(fill_history=mask)
-        self.history[~mask] = history[~mask]
-        obs["policy"] = self.history.clone()
-        return obs
+        return self._compute_obs(fill_history=mask)
 
     def pin_reset_frames(self, frames: torch.Tensor | None):
         """Make every later reset (including auto-resets in ``step``) start env i at ``frames[i]``; None unpins."""
@@ -411,9 +407,10 @@ class G1TrackingEnv:
         noisy = proprio
         if self.cfg.add_noise:
             noisy = proprio + (2.0 * torch.rand_like(proprio) - 1.0) * self.noise_scale
-        self.history = torch.roll(self.history, -1, dims=1)
-        self.history[:, -1] = noisy
-        if fill_history is not None:
+        if fill_history is None:  # one control step passed: every env appends a frame
+            self.history = torch.roll(self.history, -1, dims=1)
+            self.history[:, -1] = noisy
+        else:  # no time passed: only the reset envs change, the rest keep their history
             self.history[fill_history] = noisy[fill_history, None].expand(-1, self.cfg.history_len, -1)
 
         root_pos = self.body_q[:, self.root_idx, :3]

@@ -22,13 +22,13 @@ benchmark protocol. *Score* is the normalized return; the percentiles rank clips
 
 | | | |
 |---|---|---|
-| ![Basic dance slide](docs/media/dance_slide.gif) | ![Door handle motion](docs/media/door_handle.gif) | ![Sideways jog](docs/media/jog_sideways.gif) |
-| Dance slide, median, score 0.979 | Door handle, median, score 0.978 | Sideways jog, 10th percentile, score 0.914 |
-| ![Hip-hop dance](docs/media/dance_hiphop.gif) | ![Jog with a 270 degree spin](docs/media/jog_spin.gif) | ![Fall from a cross-legged sit](docs/media/sit_fall.gif) |
-| Hip-hop dance, 1st percentile, score 0.819 | Jog with spin, lowest score without a fall, 0.439 | Cross-legged sit, a failed clip, score 0.601 |
+| ![Dance with head accents](docs/media/dance_accent.gif) | ![Closing a door by the knob](docs/media/door_knob.gif) | ![Sideways jog](docs/media/jog_sideways.gif) |
+| Dance with head accents, median, score 0.984 | Door knob, median, score 0.984 | Sideways jog, 10th percentile, score 0.939 |
+| ![Hip-hop dance](docs/media/dance_hiphop.gif) | ![Seated arm motion](docs/media/lowest_score.gif) | ![Fall from a cross-legged sit](docs/media/sit_fall.gif) |
+| Hip-hop dance, 1st percentile, score 0.862 | Seated arm motion, lowest score without a fall, 0.462 | Cross-legged sit, failed in both passes, score 0.720 |
 
-The same policy in stock MuJoCo, on three of the clips above. All three complete, including the sitting motion
-that failed in the training simulator's first pass:
+The same policy in stock MuJoCo on three harder clips. All three complete, including a sitting motion that failed in
+one of the two passes in the training simulator:
 
 | | | |
 |---|---|---|
@@ -41,19 +41,23 @@ Mean normalized return and failure counts for the 60,000-iteration checkpoint:
 
 | Simulator | Clips | Failed | Failure rate | Normalized return |
 |---|---:|---:|---:|---:|
-| Newton + MuJoCo Warp, pass 1 | 121,567 | 91 | 0.075% | 0.964 |
-| Newton + MuJoCo Warp, pass 2 (shuffled) | 121,567 | 84 | 0.069% | not recorded |
-| Newton + MuJoCo Warp | 1,000 subset | 0 | 0% | 0.966 |
+| Newton + MuJoCo Warp, pass 1 | 121,567 | 23 | 0.019% | 0.974 |
+| Newton + MuJoCo Warp, pass 2 (shuffled) | 121,567 | 24 | 0.020% | 0.974 |
+| Newton + MuJoCo Warp | 1,000 subset | 0 | 0% | 0.975 |
 | Stock MuJoCo (CPU) | 1,000 subset | 0 falls, 1 solver failure | 0.1% | 0.975 |
 
-In pass 1 the median return was 0.978, the 10th percentile 0.914 and the 1st percentile 0.815. A 1,000-clip subset
-cannot resolve a failure rate near 0.07%, so the last two rows show only that there is no large sim-to-sim gap.
-The higher MuJoCo return is not yet explained. The single MuJoCo failure is numerical: the solver produced non-finite
-accelerations at a hand-to-shoulder self-contact while the robot was upright, with a return of 0.961 up to that point.
-It recurred at the same time step with physics steps of 5, 2.5 and 1 ms.
+In pass 1 the median return was 0.984, the 10th percentile 0.939 and the 1st percentile 0.862. The two simulators
+return the same mean on the 1,000-clip subset, although that subset cannot resolve a failure rate near 0.02%. The
+single MuJoCo failure is numerical: the solver produced non-finite accelerations at a hand-to-shoulder self-contact
+while the robot was upright, with a return of 0.961 up to that point. It recurred at the same time step with physics
+steps of 5, 2.5 and 1 ms.
 
-Failures concentrate in seated and getting-up motions. Across 11 reruns of the 91 failed clips, 10 clips failed at
-least 10 times, and 9 of those were sitting or getting up. Another 32 clips did not fail again.
+Failures concentrate in seated and getting-up motions. The two passes share 21 of 26 distinct failed clips, and 16 of
+those 21 are sitting or standing up from the ground.
+
+These figures supersede an earlier evaluation that scored 0.964 with 91 failures. That run was affected by a bug that
+shifted every environment's observation history whenever any environment reset; the bug was fixed in the environment,
+and the policy was not retrained.
 
 ### Training stability
 
@@ -222,9 +226,13 @@ BONES-SEED data and anything derived from it is licensed, and `data/` is exclude
 
 ## Known limitations
 
-- **Evaluation is not fully repeatable.** Identical states and actions diverge after the first physics step, and
-  results depend on which clips share a batch, though not on batch size alone. The cause is not yet confirmed. Compare
-  checkpoints over several shuffled passes rather than by a fixed list of failed clips.
+- **Evaluation varies slightly between runs.** MuJoCo Warp orders contacts and constraints differently from run to
+  run, so identical states diverge after the first physics step. The effect is small: the two shuffled passes agree
+  on the mean return, differ by 0.0001 per clip on average, and disagree on 5 of 26 failed clips. Clips near failure
+  can therefore flip between runs.
+- **Training predates the observation-history fix.** The checkpoint was trained with the bug in simulator data
+  collection, although imagined rollouts rebuilt their history correctly. Return figures under *Training stability*
+  were also measured with the bug, so they are comparable with each other but not with the table above.
 - **The training simulator has two floor planes.** Newton's model holds both the MJCF floor and an added ground plane at
   the same height, which doubles ground contacts. Friction randomization is unaffected. This should be fixed before the
   next training run.
@@ -239,7 +247,6 @@ BONES-SEED data and anything derived from it is licensed, and `data/` is exclude
 2. Improve seated and getting-up motions.
 3. Score the full library in stock MuJoCo and resolve the self-contact solver failure.
 4. Train towards the paper's 320,000 iterations and add further motion data.
-5. Identify the source of the evaluation variance.
 
 ## Acknowledgements
 
